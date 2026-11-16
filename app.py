@@ -12,9 +12,13 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta
 
 import anthropic
 from flask import Flask, abort, jsonify, request
@@ -28,6 +32,10 @@ CHASE_TOKEN = os.environ.get("CHASE_TOKEN", "")           # protects /chase
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
 CHASE_AFTER_HOURS = int(os.environ.get("CHASE_AFTER_HOURS", "24"))
 DB_PATH = os.environ.get("DB_PATH", "call_analyst.db")
+LINK_CHANNEL = os.environ.get("LINK_CHANNEL_ID", "C0B85LPLN1Y")    # paste a Fathom link here -> recap in thread
+FATHOM_API_KEY = os.environ.get("FATHOM_API_KEY", "")              # needed for the paste-a-link flow
+FATHOM_API = "https://api.fathom.ai/external/v1/meetings"
+FATHOM_LINK = re.compile(r"https?://(?:www\.)?fathom\.video/[^\s>|]+", re.I)
 
 app = Flask(__name__)
 slack = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
@@ -133,7 +141,8 @@ def bullets(items):
     return "\n".join(f"• {i}" for i in items) or "_None_"
 
 
-def post_recap(meeting: dict, a: dict) -> str:
+def post_recap(meeting: dict, a: dict, channel=None, thread_ts=None) -> str:
+    channel = channel or SLACK_CHANNEL
     url = meeting.get("share_url") or meeting.get("url") or ""
     title = meeting.get("title") or meeting.get("meeting_title") or "Call"
     blocks = [
@@ -151,11 +160,11 @@ def post_recap(meeting: dict, a: dict) -> str:
     if url:
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"<{url}|View in Fathom>"}]})
 
-    res = slack.chat_postMessage(channel=SLACK_CHANNEL, text=f"Call recap: {title}", blocks=blocks)
-    ts = res["ts"]
+    res = slack.chat_postMessage(channel=channel, thread_ts=thread_ts, text=f"Call recap: {title}", blocks=blocks)
+    ts = thread_ts or res["ts"]
 
     if a.get("follow_up_draft"):
-        slack.chat_postMessage(channel=SLACK_CHANNEL, thread_ts=ts,
+        slack.chat_postMessage(channel=channel, thread_ts=ts,
                                text=f"*Draft follow-up (edit before sending):*\n>>> {a['follow_up_draft']}")
     return ts
 
@@ -183,6 +192,66 @@ def dm_action_items(meeting, a):
                          + (f" (due {item['due']})" if item.get("due") else "")
                          + (f"\n<{url}|Call recording>" if url else "")
                          + "\nReply `done` in this DM when it's complete.")
+
+
+# ---------------------------------------------------------------- paste-a-link flow
+def _norm(url):
+    url = (url or "").split("?")[0].split("#")[0].rstrip("/").lower()
+    return re.sub(r"^https?://(www\.)?", "", url)
+
+
+def fathom_get(params):
+    req = urllib.request.Request(FATHOM_API + "?" + urllib.parse.urlencode(params),
+                                 headers={"X-Api-Key": FATHOM_API_KEY, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read())
+
+
+def fetch_meeting_by_link(link):
+    """Find the call in Fathom from its link, then reload it with the transcript."""
+    target, cursor, found = _norm(link), None, None
+    for _ in range(20):
+        page = fathom_get({"cursor": cursor} if cursor else {})
+        found = next((m for m in page.get("items", [])
+                      if target in (_norm(m.get("url")), _norm(m.get("share_url")))), None)
+        cursor = page.get("next_cursor")
+        if found or not cursor:
+            break
+    if not found:
+        return None
+    created = datetime.fromisoformat(found["created_at"].replace("Z", "+00:00"))
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    page = fathom_get({"created_after": (created - timedelta(minutes=2)).strftime(fmt),
+                       "created_before": (created + timedelta(minutes=2)).strftime(fmt),
+                       "include_transcript": "true"})
+    return next((m for m in page.get("items", []) if m.get("recording_id") == found.get("recording_id")), found)
+
+
+def process_link(channel, ts, link):
+    wait = slack.chat_postMessage(channel=channel, thread_ts=ts, text=":hourglass_flowing_sand: Reading the call…")
+
+    def fail(text):
+        slack.chat_update(channel=channel, ts=wait["ts"], text=text)
+
+    try:
+        if not FATHOM_API_KEY:
+            return fail(":x: FATHOM_API_KEY is missing in Railway > Variables.")
+        meeting = fetch_meeting_by_link(link)
+        if not meeting:
+            return fail(":x: I couldn't find this call in Fathom. It must be recorded by, or shared with "
+                        "the team of, the account that owns the Fathom API key.")
+        if not transcript_text(meeting).strip():
+            return fail(":x: Fathom has no transcript for this call yet. Try again in a few minutes.")
+        a = analyze(meeting)
+        post_recap(meeting, a, channel=channel, thread_ts=ts)
+        slack.chat_delete(channel=channel, ts=wait["ts"])
+        alert_signals(meeting, a)
+    except Exception as e:
+        app.logger.exception("link processing failed")
+        fail(f":warning: Call Analyst failed on {link}: {e}")
+
+
+link_seen, link_lock = set(), threading.Lock()
 
 
 # ---------------------------------------------------------------- pipeline
@@ -238,7 +307,19 @@ def slack_events():
     body = request.get_json(force=True)
     if body.get("type") == "url_verification":
         return jsonify(challenge=body["challenge"])
+    if request.headers.get("X-Slack-Retry-Num"):      # Slack retry: first delivery is already running
+        return jsonify(ok=True)
     ev = body.get("event", {})
+    if ev.get("type") == "message" and ev.get("channel") == LINK_CHANNEL \
+            and not ev.get("bot_id") and not ev.get("subtype"):
+        m = FATHOM_LINK.search(ev.get("text") or "")
+        key = (ev.get("channel"), ev.get("ts"))
+        with link_lock:
+            fresh = bool(m) and key not in link_seen
+            link_seen.add(key)
+        if fresh:
+            threading.Thread(target=process_link, args=(key[0], key[1], m.group(0)), daemon=True).start()
+        return jsonify(ok=True)
     if ev.get("type") == "message" and ev.get("channel_type") == "im" and not ev.get("bot_id") \
             and ev.get("text", "").strip().lower() == "done":
         with db_lock, db() as c:
