@@ -231,7 +231,8 @@ def fetch_meeting_by_link(link):
 
 def md_to_slack(md):
     """Fathom writes Markdown; Slack uses its own lighter syntax."""
-    md = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"<\2|\1>", md)          # [text](url) -> <url|text>
+    md = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", md)               # [text](url) -> text (keeps the recap readable)
+    md = re.sub(r"\\([<>*_#~.!()\[\]-])", r"\1", md)                  # drop Markdown escapes like \<
     md = re.sub(r"\*\*(.+?)\*\*", r"*\1*", md)                        # **bold** -> *bold*
     md = re.sub(r"(?m)^#{1,6}\s*(.+?)\s*$", r"*\1*", md)               # ## Heading -> *Heading*
     md = re.sub(r"(?m)^(\s*)[-*]\s+", r"\1• ", md)                     # - item -> • item
@@ -290,7 +291,7 @@ def process_link(channel, ts, link):
             chunks = [text[i:i + 3500] for i in range(0, len(text), 3500)]
             slack.chat_update(channel=channel, ts=wait["ts"], text=chunks[0])
             for extra in chunks[1:]:
-                slack.chat_postMessage(channel=channel, thread_ts=ts, text=extra)
+                slack.chat_postMessage(channel=channel, thread_ts=ts, text=extra, unfurl_links=False, unfurl_media=False)
             return
         if not transcript_text(meeting).strip():
             return fail(":x: Fathom has no transcript for this call yet. Try again in a few minutes.")
