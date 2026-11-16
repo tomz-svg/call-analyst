@@ -35,6 +35,7 @@ DB_PATH = os.environ.get("DB_PATH", "call_analyst.db")
 LINK_CHANNEL = os.environ.get("LINK_CHANNEL_ID", "C0B85LPLN1Y")    # paste a Fathom link here -> recap in thread
 FATHOM_API_KEY = os.environ.get("FATHOM_API_KEY", "")              # needed for the paste-a-link flow
 FATHOM_API = "https://api.fathom.ai/external/v1/meetings"
+USE_CLAUDE = os.environ.get("USE_CLAUDE", "") == "1"                # off = free mode: post Fathom's own summary
 FATHOM_LINK = re.compile(r"https?://(?:www\.)?fathom\.video/[^\s>|]+", re.I)
 
 app = Flask(__name__)
@@ -223,8 +224,50 @@ def fetch_meeting_by_link(link):
     fmt = "%Y-%m-%dT%H:%M:%SZ"
     page = fathom_get({"created_after": (created - timedelta(minutes=2)).strftime(fmt),
                        "created_before": (created + timedelta(minutes=2)).strftime(fmt),
-                       "include_transcript": "true"})
+                       "include_transcript": "true" if USE_CLAUDE else "false",
+                       "include_summary": "true", "include_action_items": "true"})
     return next((m for m in page.get("items", []) if m.get("recording_id") == found.get("recording_id")), found)
+
+
+def md_to_slack(md):
+    """Fathom writes Markdown; Slack uses its own lighter syntax."""
+    md = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"<\2|\1>", md)          # [text](url) -> <url|text>
+    md = re.sub(r"\*\*(.+?)\*\*", r"*\1*", md)                        # **bold** -> *bold*
+    md = re.sub(r"(?m)^#{1,6}\s*(.+?)\s*$", r"*\1*", md)               # ## Heading -> *Heading*
+    md = re.sub(r"(?m)^(\s*)[-*]\s+", r"\1• ", md)                     # - item -> • item
+    return md.strip()
+
+
+def fathom_recap_text(meeting):
+    """Free recap built only from what Fathom already wrote (no AI call)."""
+    summary = ((meeting.get("default_summary") or {}).get("markdown_formatted") or "").strip()
+    items = meeting.get("action_items") or []
+    if not summary and not items:
+        return ""
+    title = meeting.get("title") or meeting.get("meeting_title") or "Call"
+    url = meeting.get("share_url") or meeting.get("url") or ""
+    head = [f"<{url}|Recording>"] if url else []
+    try:
+        start = datetime.fromisoformat(meeting["recording_start_time"].replace("Z", "+00:00"))
+        end = datetime.fromisoformat(meeting["recording_end_time"].replace("Z", "+00:00"))
+        secs = int((end - start).total_seconds())
+        head.append(f"Duration: {secs // 60}:{secs % 60:02d}")
+    except Exception:
+        pass
+    names = [i.get("name") or i.get("email") for i in (meeting.get("calendar_invitees") or [])]
+    names = [n for n in names if n]
+    if names:
+        head.append("Attendees: " + ", ".join(names))
+    parts = [f"*Call Recap: {title}*", " | ".join(head)]
+    if summary:
+        parts.append(md_to_slack(summary))
+    if items:
+        lines = []
+        for it in items:
+            who = (it.get("assignee") or {}).get("name")
+            lines.append(f"• {it.get('description', '').strip()}" + (f" — _{who}_" if who else ""))
+        parts.append("*Action items*\n" + "\n".join(lines))
+    return "\n\n".join(p for p in parts if p)
 
 
 def process_link(channel, ts, link):
@@ -240,6 +283,15 @@ def process_link(channel, ts, link):
         if not meeting:
             return fail(":x: I couldn't find this call in Fathom. It must be recorded by, or shared with "
                         "the team of, the account that owns the Fathom API key.")
+        if not USE_CLAUDE:
+            text = fathom_recap_text(meeting)
+            if not text:
+                return fail(":x: Fathom hasn't finished the summary for this call yet. Try again in a few minutes.")
+            chunks = [text[i:i + 3500] for i in range(0, len(text), 3500)]
+            slack.chat_update(channel=channel, ts=wait["ts"], text=chunks[0])
+            for extra in chunks[1:]:
+                slack.chat_postMessage(channel=channel, thread_ts=ts, text=extra)
+            return
         if not transcript_text(meeting).strip():
             return fail(":x: Fathom has no transcript for this call yet. Try again in a few minutes.")
         a = analyze(meeting)
