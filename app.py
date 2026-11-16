@@ -239,6 +239,36 @@ def md_to_slack(md):
     return md.strip()
 
 
+KEEP_SECTIONS = re.compile(r"purpose|takeaway|outcome|objection|next step|action item|decision|summary", re.I)
+
+
+def split_sections(md):
+    """Cut Fathom's Markdown summary into (heading, lines) pairs."""
+    sections, cur = [], None
+    for line in md.splitlines():
+        m = re.match(r"^#{1,6}\s*(.+?)\s*#*$", line) or re.match(r"^\*\*([^*]+?)\*\*:?\s*$", line)
+        if m:
+            cur = [m.group(1).strip().rstrip(":"), []]
+            sections.append(cur)
+        elif line.strip():
+            if cur is None:
+                cur = ["Overview", []]
+                sections.append(cur)
+            cur[1].append(line)
+    return [sec for sec in sections if sec[1]]
+
+
+def short_lines(lines, limit=3):
+    """Keep only the main points of a section: top-level lines, trimmed."""
+    least = min(len(ln) - len(ln.lstrip()) for ln in lines)
+    top = [ln for ln in lines if len(ln) - len(ln.lstrip()) == least]
+    out = []
+    for ln in top[:limit]:
+        text = md_to_slack(ln.strip())
+        out.append(text if len(text) <= 220 else text[:217].rstrip() + "…")
+    return out
+
+
 def fathom_recap_text(meeting):
     """Free recap built only from what Fathom already wrote (no AI call)."""
     summary = ((meeting.get("default_summary") or {}).get("markdown_formatted") or "").strip()
@@ -247,7 +277,7 @@ def fathom_recap_text(meeting):
         return ""
     title = meeting.get("title") or meeting.get("meeting_title") or "Call"
     url = meeting.get("share_url") or meeting.get("url") or ""
-    head = [f"<{url}|Recording>"] if url else []
+    head = [f"Recording: <{url}|Link>"] if url else []
     try:
         start = datetime.fromisoformat(meeting["recording_start_time"].replace("Z", "+00:00"))
         end = datetime.fromisoformat(meeting["recording_end_time"].replace("Z", "+00:00"))
@@ -259,16 +289,23 @@ def fathom_recap_text(meeting):
     names = [n for n in names if n]
     if names:
         head.append("Attendees: " + ", ".join(names))
-    parts = [f"*Call Recap: {title}*", " | ".join(head)]
-    if summary:
-        parts.append(md_to_slack(summary))
-    if items:
-        lines = []
-        for it in items:
+
+    sections = split_sections(summary)
+    picked = [sec for sec in sections if KEEP_SECTIONS.search(sec[0])]
+    if len(picked) < 2:
+        picked = sections[:3]
+    blocks = [(name, short_lines(lines)) for name, lines in picked]
+    if items and not any(re.search(r"next step|action item", name, re.I) for name, _ in blocks):
+        steps = []
+        for it in items[:5]:
             who = (it.get("assignee") or {}).get("name")
-            lines.append(f"• {it.get('description', '').strip()}" + (f" — _{who}_" if who else ""))
-        parts.append("*Action items*\n" + "\n".join(lines))
-    return "\n\n".join(p for p in parts if p)
+            steps.append(f"• {it.get('description', '').strip()}" + (f" — _{who}_" if who else ""))
+        blocks.append(("Next Steps", steps))
+
+    parts = [f"*Fathom AI Meeting Recap: {title}*\n*Summary*\n" + " | ".join(head)]
+    for n, (name, lines) in enumerate(blocks, 1):
+        parts.append(f"*{n}. {name.upper()}*\n" + "\n".join(lines))
+    return "\n\n".join(parts)
 
 
 def process_link(channel, ts, link):
